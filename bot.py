@@ -26,12 +26,17 @@ from database.db import (
 from crypto.commitment import generate_nonce, make_commitment, verify_commitment
 from tournament.bracket import Tournament
 from tournament.game_manager import GameManager
+from tournament.rules import MOVES, get_rule_set
+import random
 
+active_rule_set = None
 active_tournament = None
 game_manager = GameManager()
+active_matches = {}
+active_byes = []
 
 RULES = {
-    1: "Rock, Paper, Scissors, Fire, Well",
+    1: "Rock, Paper, Scissors, Well",
     2: "Rock, Paper, Scissors, Lizard, Spock",
     3: "Rock, Paper, Scissors, Fire, Water",
 }
@@ -39,9 +44,68 @@ RULES = {
 def is_admin(user_id: int) -> bool:
     return str(user_id) == str(ADMIN_TELEGRAM_USER_ID)
 
+def all_matches_finished():
+    if not active_matches:
+        return False
+
+    return all(
+        game_manager.is_finished(match_id)
+        for match_id in active_matches
+    )
+
+def get_match_winners():
+    winners = []
+
+    for match in active_matches.values():
+        winner = match.get("winner")
+
+        if winner is not None:
+            winners.append(winner)
+
+    return winners
+
+def start_round(rule_set):
+    global active_matches, active_byes
+
+    prepared = active_tournament.prepare_round()
+    matches = active_tournament.create_matches()
+    byes = active_tournament.get_bye_players()
+
+    active_matches.clear()
+    active_byes = list(byes)
+
+    # Los matches de la ronda anterior ya terminaron.
+    # Limpiamos su estado antes de crear los nuevos.
+    game_manager.matches.clear()
+
+    participant_telegram_ids = {
+        participant["voting_credential"]: participant["telegram_user_id"]
+        for participant in get_all_participants()
+    }
+
+    for index, (player_a, player_b) in enumerate(matches, start=1):
+        match_id = f"match-{index}"
+
+        game_manager.create_match(
+            match_id,
+            player_a,
+            player_b,
+            rule_set,
+        )
+
+        active_matches[match_id] = {
+            "player_a": player_a,
+            "player_b": player_b,
+            "player_a_telegram_id": participant_telegram_ids[player_a],
+            "player_b_telegram_id": participant_telegram_ids[player_b],
+            "rule_set": rule_set,
+        }
+
+    return matches, byes
+
 def rules_keyboard(options):
     labels = {
-        1: "🪨 Fire, 🪣 Well",
+        1: "🪨 Rock, 🪣 Well",
         2: "🦎 Lizard, 🖖 Spock",
         3: "🔥 Fire, 💧 Water",
     }
@@ -58,9 +122,64 @@ def rules_keyboard(options):
 
     return InlineKeyboardMarkup(keyboard)
 
+def move_keyboard(match_id):
+    match = active_matches[match_id]
+    rule_set = match["rule_set"]
+
+    rules = get_rule_set(rule_set)
+    moves = rules["moves"]
+
+    emojis = {
+        1: "🪨",
+        2: "📄",
+        3: "✂️",
+        4: {
+            1: "🪣",  # Well
+            2: "🦎",  # Lizard
+            3: "🔥",  # Fire
+        },
+        5: {
+            2: "🖖",  # Spock
+            3: "💧",  # Water
+        },
+    }
+
+    keyboard = []
+    row = []
+
+    for move_number, move_name in moves.items():
+        emoji = emojis[move_number]
+
+        if isinstance(emoji, dict):
+            emoji = emoji[rule_set]
+
+        row.append(
+            InlineKeyboardButton(
+                f"{emoji} {move_name}",
+                callback_data=f"move:{match_id}:{move_number}",
+            )
+        )
+
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+
+    if row:
+        keyboard.append(row)
+
+    return InlineKeyboardMarkup(keyboard)
+
 def generate_voting_credential() -> str:
     import secrets
     return "VC-" + secrets.token_hex(16).upper()
+
+def get_participant_credential(telegram_user_id):
+    participant = get_participant(telegram_user_id)
+
+    if not participant:
+        return None
+
+    return participant["voting_credential"]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -451,7 +570,7 @@ async def start_tiebreak(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def start_tournament(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global active_tournament
+    global active_tournament, active_rule_set
 
     user_id = update.effective_user.id
 
@@ -467,28 +586,141 @@ async def start_tournament(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if len(context.args) > 2:
+        await update.message.reply_text(
+            "Uso:\n"
+            "/start_tournament\n"
+            "/start_tournament NUMERO\n"
+            "/start_tournament CREDENCIAL_A CREDENCIAL_B"
+        )
+        return
+
     participants = get_all_participants()
 
     if len(participants) < 2:
         await update.message.reply_text(
-            "No hay suficientes participantes para iniciar el torneo.\n"
-            f"Participantes registrados: {len(participants)}"
+            "Se necesitan al menos 2 participantes para iniciar el torneo."
         )
         return
 
+    # ---------------------------------------------------------
+    # Selección de participantes
+    # ---------------------------------------------------------
+
+    if len(context.args) == 2:
+        # Selección explícita mediante credenciales
+        requested_credentials = context.args
+
+        if requested_credentials[0] == requested_credentials[1]:
+            await update.message.reply_text(
+                "Las dos credenciales deben ser diferentes."
+            )
+            return
+
+        participants_by_credential = {
+            participant["voting_credential"]: participant
+            for participant in participants
+        }
+
+        missing_credentials = [
+            credential
+            for credential in requested_credentials
+            if credential not in participants_by_credential
+        ]
+
+        if missing_credentials:
+            await update.message.reply_text(
+                "No se encontraron las siguientes credenciales:\n\n"
+                + "\n".join(
+                    f"• `{credential}`"
+                    for credential in missing_credentials
+                ),
+                parse_mode="Markdown"
+            )
+            return
+
+        participants = [
+            participants_by_credential[credential]
+            for credential in requested_credentials
+        ]
+
+    elif len(context.args) == 1:
+        # Selección aleatoria mediante cantidad
+        try:
+            requested_count = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text(
+                "El argumento debe ser un número entero "
+                "o dos credenciales de participantes."
+            )
+            return
+
+        if requested_count < 2:
+            await update.message.reply_text(
+                "El torneo debe tener al menos 2 participantes."
+            )
+            return
+
+        if requested_count > len(participants):
+            await update.message.reply_text(
+                f"No hay suficientes participantes registrados.\n\n"
+                f"Participantes disponibles: {len(participants)}\n"
+                f"Solicitados: {requested_count}"
+            )
+            return
+
+        participants = random.sample(
+            participants,
+            requested_count
+        )
+
+    # Si no se proporcionaron argumentos, se utilizan todos.
     participant_ids = [
         participant["voting_credential"]
         for participant in participants
     ]
 
+    # ---------------------------------------------------------
+    # Obtener la variante ganadora de la votación
+    # ---------------------------------------------------------
+
+    config = get_voting_config()
+    round_number = config["round_number"]
+
+    rule_result = determine_rule_result(round_number)
+
+    if rule_result["status"] == "no_votes":
+        await update.message.reply_text(
+            "⚠️ No existen votos verificados para seleccionar "
+            "las reglas del torneo."
+        )
+        return
+
+    if rule_result["status"] == "tie":
+        tied = ", ".join(
+            str(option)
+            for option in rule_result["tied_options"]
+        )
+
+        await update.message.reply_text(
+            "⚠️ No se puede iniciar el torneo porque existe "
+            "un empate en la votación de reglas.\n\n"
+            f"Opciones empatadas: {tied}\n\n"
+            "Realiza el desempate antes de iniciar el torneo."
+        )
+        return
+
+    rule_set = rule_result["winner"]
+
+    active_rule_set = rule_set
+
     active_tournament = Tournament(participant_ids)
 
-    prepared = active_tournament.prepare_round()
-    matches = active_tournament.create_matches()
-    byes = active_tournament.get_bye_players()
+    matches, byes = start_round(active_rule_set)
 
     message = (
         "🏆 *Primera ronda preparada*\n\n"
+        f"Reglas seleccionadas: {RULES[rule_set]}\n"
         f"Participantes: {len(participant_ids)}\n"
         f"Matches: {len(matches)}\n"
     )
@@ -512,6 +744,247 @@ async def start_tournament(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+async def play_match_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user_id = update.effective_user.id
+
+    credential = get_participant_credential(user_id)
+
+    if not credential:
+        await update.message.reply_text(
+            "No estás registrado como participante."
+        )
+        return
+
+    if not active_matches:
+        await update.message.reply_text(
+            "No hay matches activos."
+        )
+        return
+
+    for match_id, match in active_matches.items():
+        match_number = match_id.split("-")[1]
+
+        if game_manager.is_finished(match_id):
+            if credential in (match["player_a"], match["player_b"]):
+                await update.message.reply_text(
+                    f"🏁 Match {match_number} ya terminó.\n\n"
+                    "No puedes realizar más jugadas en este match."
+                )
+                return
+
+        if credential == match["player_a"]:
+            await update.message.reply_text(
+                f"🎮 Match {match_number}\n\n"
+                "Eres el jugador A.\n\n"
+                "Selecciona tu jugada:",
+                reply_markup=move_keyboard(match_id)
+            )
+            return
+
+        if credential == match["player_b"]:
+            await update.message.reply_text(
+                f"🎮 Match {match_number}\n\n"
+                "Eres el jugador B.\n\n"
+                "Selecciona tu jugada:",
+                reply_markup=move_keyboard(match_id)
+            )
+            return
+
+    await update.message.reply_text(
+        "No tienes un match activo en esta ronda."
+    )
+
+async def move_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+
+    _, match_id, move_text = data.split(":")
+
+    move = int(move_text)
+
+    user_id = query.from_user.id
+
+    credential = get_participant_credential(user_id)
+
+    if not credential:
+        await query.edit_message_text(
+            "No estás registrado como participante."
+        )
+        return
+
+    if match_id not in active_matches:
+        await query.edit_message_text(
+            "El match ya no está activo."
+        )
+        return
+
+    match = active_matches[match_id]
+
+    if credential not in (
+        match["player_a"],
+        match["player_b"],
+    ):
+        await query.edit_message_text(
+            "No perteneces a este match."
+        )
+        return
+
+    try:
+        result = game_manager.submit_move(
+            match_id,
+            credential,
+            move,
+        )
+    except ValueError as error:
+        await query.answer(
+            str(error),
+            show_alert=True,
+        )
+        return
+
+    if result is None:
+        await query.edit_message_text(
+            "✅ Tu jugada fue registrada.\n\n"
+            "Esperando la jugada del otro participante."
+        )
+        return
+
+    state = game_manager.get_match(match_id)
+
+    move_a, move_b = state["results"][-1]
+
+    round_number = len(state["results"])
+
+    if result == "A":
+        round_result = "🏆 Ganó el Jugador A"
+    elif result == "B":
+        round_result = "🏆 Ganó el Jugador B"
+    else:
+        round_result = "🤝 Empate"
+
+    score_text = (
+        f"Jugador A: {state['wins_a']}\n"
+        f"Jugador B: {state['wins_b']}"
+    )
+
+    if state["finished"]:
+        if state["winner"] == match["player_a"]:
+            match_winner = "Jugador A"
+        else:
+            match_winner = "Jugador B"
+
+        active_matches[match_id]["winner"] = state["winner"]
+
+        if all_matches_finished():
+            winners = get_match_winners()
+
+            winners.extend(active_byes)
+
+            active_tournament.advance(winners)
+
+            if active_tournament.is_finished():
+                tournament_winner = active_tournament.get_winner()
+
+                participant_telegram_ids = {
+                    participant["voting_credential"]: participant["telegram_user_id"]
+                    for participant in get_all_participants()
+                }
+
+                winner_telegram_id = participant_telegram_ids[tournament_winner]
+
+                await context.bot.send_message(
+                    chat_id=winner_telegram_id,
+                    text=(
+                        "🏆 ¡Has ganado el torneo!\n\n"
+                        "Eres el campeón del torneo."
+                    )
+                )
+
+            else:
+                start_round(match["rule_set"])
+
+                for next_match_id, next_match in active_matches.items():
+                    match_number = next_match_id.split("-")[1]
+
+                    await context.bot.send_message(
+                        chat_id=next_match["player_a_telegram_id"],
+                        text=(
+                            f"🎮 Nueva ronda\n\n"
+                            f"Match {match_number}\n"
+                            "Eres el jugador A.\n\n"
+                            "Usa /play_match para realizar tu jugada."
+                        )
+                    )
+
+                    await context.bot.send_message(
+                        chat_id=next_match["player_b_telegram_id"],
+                        text=(
+                            f"🎮 Nueva ronda\n\n"
+                            f"Match {match_number}\n"
+                            "Eres el jugador B.\n\n"
+                            "Usa /play_match para realizar tu jugada."
+                        )
+                    )
+
+        final_message = (
+            f"🏆 Match terminado\n\n"
+            f"Ganador: {match_winner}\n\n"
+            f"📊 Marcador final:\n"
+            f"Jugador A: {state['wins_a']}\n"
+            f"Jugador B: {state['wins_b']}"
+        )
+
+        await context.bot.send_message(
+            chat_id=match["player_a_telegram_id"],
+            text=final_message
+        )
+
+        await context.bot.send_message(
+            chat_id=match["player_b_telegram_id"],
+            text=final_message
+        )
+
+        await query.edit_message_text(
+            "✅ Tu jugada fue registrada.\n\n"
+            "El match ha terminado."
+        )
+
+        return
+
+    rules = get_rule_set(state["rule_set"])
+
+    result_message = (
+        f"🎮 Resultado de la ronda {round_number}\n\n"
+        f"Jugador A: {rules['moves'][move_a]}\n"
+        f"Jugador B: {rules['moves'][move_b]}\n\n"
+        f"{round_result}\n\n"
+        f"📊 Marcador:\n"
+        f"{score_text}"
+    )
+
+    await context.bot.send_message(
+        chat_id=match["player_a_telegram_id"],
+        text=result_message
+    )
+
+    await context.bot.send_message(
+        chat_id=match["player_b_telegram_id"],
+        text=result_message
+    )
+
+    await query.edit_message_text(
+        "✅ Tu jugada fue registrada.\n\n"
+        "La ronda ha terminado. Revisa el resultado y el marcador."
+    )
+
 def main():
     init_db()
     application = Application.builder().token(BOT_TOKEN).build()
@@ -523,6 +996,13 @@ def main():
         CallbackQueryHandler(
             vote_callback,
             pattern=r"^vote:[123]$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            move_callback,
+            pattern=r"^move:match-\d+:[1-5]$"
         )
     )
 
@@ -556,6 +1036,10 @@ def main():
 
     application.add_handler(
         CommandHandler("start_tiebreak", start_tiebreak)
+    )
+
+    application.add_handler(
+        CommandHandler("play_match", play_match_command)
     )
 
     print("Bot iniciado...")

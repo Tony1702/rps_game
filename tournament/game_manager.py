@@ -1,10 +1,17 @@
 from tournament.rules import validate_move, determine_winner
 
+
 class GameManager:
     def __init__(self):
         self.matches = {}
 
-    def create_match(self, match_id, player_a, player_b):
+    def create_match(
+        self,
+        match_id,
+        player_a,
+        player_b,
+        rule_set=2,
+    ):
         if match_id in self.matches:
             raise ValueError("El match ya existe.")
 
@@ -13,9 +20,15 @@ class GameManager:
                 "Un participante no puede enfrentarse contra sí mismo."
             )
 
+        if rule_set not in (1, 2, 3):
+            raise ValueError(
+                "La variante de juego no es válida."
+            )
+
         self.matches[match_id] = {
             "player_a": player_a,
             "player_b": player_b,
+            "rule_set": rule_set,
             "round": 1,
             "moves": {},
             "results": [],
@@ -50,7 +63,10 @@ class GameManager:
                 "El participante no pertenece al match."
             )
 
-        if not validate_move(move):
+        if not validate_move(
+            move,
+            match["rule_set"],
+        ):
             raise ValueError("La jugada no es válida.")
 
         if player in match["moves"]:
@@ -67,7 +83,6 @@ class GameManager:
 
     def has_submitted_move(self, match_id, player):
         match = self.get_match(match_id)
-
         return player in match["moves"]
 
     def resolve_round(self, match_id):
@@ -79,7 +94,10 @@ class GameManager:
         player_a = match["player_a"]
         player_b = match["player_b"]
 
-        if player_a not in match["moves"] or player_b not in match["moves"]:
+        if (
+            player_a not in match["moves"]
+            or player_b not in match["moves"]
+        ):
             raise ValueError(
                 "Todavía no han jugado ambos participantes."
             )
@@ -87,7 +105,11 @@ class GameManager:
         move_a = match["moves"][player_a]
         move_b = match["moves"][player_b]
 
-        result = determine_winner(move_a, move_b)
+        result = determine_winner(
+            move_a,
+            move_b,
+            match["rule_set"],
+        )
 
         match["results"].append(
             (move_a, move_b)
@@ -95,6 +117,7 @@ class GameManager:
 
         if result == "A":
             match["wins_a"] += 1
+
         elif result == "B":
             match["wins_b"] += 1
 
@@ -114,5 +137,4 @@ class GameManager:
 
     def is_finished(self, match_id):
         match = self.get_match(match_id)
-
         return match["finished"]
